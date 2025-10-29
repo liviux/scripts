@@ -1,0 +1,191 @@
+#!/bin/bash
+
+#####################################################################
+#           Pi-Finder: Raspberry Pi SSH Access Scanner              #
+#####################################################################
+#
+# WHAT IT DOES:
+# Finds all Raspberry Pis on a network that are accessible via a
+# specific SSH key.
+#
+# HOW IT WORKS:
+# 1. Asks for Username, Network Range, and SSH Key Path.
+# 2. "Primes" sudo to avoid password prompts during scans.
+# 3. Starts an 'ssh-agent' to handle your key's passphrase.
+# 4. Discovers hosts using two parallel methods:
+#    a) 'arp-scan' to find Pi-specific MAC addresses.
+#    b) 'nmap' to find any device with SSH (port 22) open.
+# 5. Merges and de-duplicates the lists.
+# 6. (OPTIMIZED) Tests SSH access on all candidates *in parallel*.
+# 7. Reports a final summary of accessible and failed devices.
+# *created using Google Gemini 2.5 Pro
+#####################################################################
+
+# --- Configuration ---
+# Raspberry Pi MAC prefixes (OUIs)
+PI_MAC_LIST='b8:27:eb|dc:a6:32|e4:5f:01|28:cd:c1'
+
+# --- Arrays to hold results ---
+declare -a SUCCESS_IPS
+declare -a FAILED_IPS
+
+# --- Dependency Check ---
+for cmd in nmap arp-scan ssh-agent ssh-add ip; do
+    if ! command -v $cmd &> /dev/null; then
+        echo "Error: Command '$cmd' not found."
+        echo "Please install the required packages (e.g., nmap, arp-scan, openssh-client, iproute2)."
+        exit 1
+    fi
+done
+
+# --- 1. Interactive Setup ---
+echo "--- Pi-Finder Setup ---"
+
+# Ask for USERNAME, default to current user
+read -p "Enter SSH username to test: " -e -i "$USER" USERNAME
+
+# Ask for NETWORK, default to a common range
+read -p "Enter network range to scan: " -e -i "192.168.0.0/24" NETWORK
+
+# Ask for KEY_PATH, default to standard SSH key
+read -p "Enter path to your SSH private key: " -e -i "$HOME/.ssh/id_rsa" KEY_PATH
+
+# Expand tilde (~) in path
+KEY_PATH_EXPANDED=$(eval echo "$KEY_PATH")
+
+if [ ! -f "$KEY_PATH_EXPANDED" ]; then
+    echo "Error: Key file not found at $KEY_PATH_EXPANDED"
+    exit 1
+fi
+
+# Find the active network interface automatically
+INTERFACE=$(ip route get 1.1.1.1 | awk '{print $5; exit}')
+if [ -z "$INTERFACE" ]; then
+    echo "Error: Could not determine active network interface. Exiting."
+    exit 1
+fi
+echo "Using network interface: $INTERFACE"
+
+# --- 2. Sudo & SSH Agent Setup ---
+
+# "Prime" sudo by asking for password now
+echo -e "\nThis script needs sudo for 'arp-scan' and 'nmap' to work effectively."
+sudo -v
+if [ $? -ne 0 ]; then
+    echo "Sudo authentication failed. Exiting."
+    exit 1
+fi
+
+# Start SSH Agent
+echo "Starting SSH agent..."
+eval $(ssh-agent -s)
+
+# Create a temporary file for parallel results
+TEMP_FILE=$(mktemp)
+
+# Trap to clean up on exit
+trap 'echo -e "\nStopping SSH agent (PID $SSH_AGENT_PID)..."; ssh-agent -k; rm -f "$TEMP_FILE"' EXIT SIGINT SIGTERM
+
+# Add SSH key
+echo "Please enter the passphrase for $KEY_PATH_EXPANDED (if it has one)..."
+ssh-add "$KEY_PATH_EXPANDED"
+if [ $? -ne 0 ]; then
+    echo "Failed to add SSH key (bad passphrase?). Exiting."
+    exit 1
+fi
+
+echo -e "\n--------------------------------------------------"
+echo "✅ SSH Key added. Starting discovery..."
+echo "--------------------------------------------------"
+
+# --- 3. Discovery Phase ---
+echo "[Discovery 1/2] Scanning for Pi MAC addresses with arp-scan..."
+ARP_IPS=$(sudo arp-scan -I "$INTERFACE" --localnet | grep -E -i "$PI_MAC_LIST" | awk '{print $1}')
+
+echo "[Discovery 2/2] Scanning for open SSH ports (22) with nmap..."
+NMAP_IPS=$(sudo nmap -p 22 --open -n -T4 "$NETWORK" -oG - | awk '/Up$/{print $2}')
+
+# --- 4. Merge Lists ---
+echo -e "\n[Discovery Complete] Merging results..."
+UNIQUE_IPS=$(echo -e "$ARP_IPS\n$NMAP_IPS" | sort -u | grep -v '^$')
+
+if [ -z "$UNIQUE_IPS" ]; then
+    echo "No potential devices found. Exiting."
+    exit 0
+fi
+
+echo "Found $(echo "$UNIQUE_IPS" | wc -l) potential IPs to test."
+
+# --- 5. SSH Test Phase (Parallel) ---
+
+# Define a function for the SSH test
+test_ssh_access() {
+    local IP=$1
+    
+    ssh_output=$(ssh -o BatchMode=yes \
+                   -o ConnectTimeout=5 \
+                   -o StrictHostKeyChecking=no \
+                   -o UserKnownHostsFile=/dev/null \
+                   -l "$USERNAME" \
+                   -i "$KEY_PATH_EXPANDED" \
+                   "$IP" 'hostname' 2>/dev/null)
+
+    if [ $? -eq 0 ]; then
+        echo "SUCCESS:$IP:$ssh_output" >> "$TEMP_FILE"
+    else
+        echo "FAILED:$IP" >> "$TEMP_FILE"
+    fi
+}
+
+echo "Beginning SSH access tests in parallel..."
+
+for IP in $UNIQUE_IPS; do
+    # Run the test in the background
+    test_ssh_access "$IP" &
+done
+
+# Wait for all background jobs to finish
+wait
+
+echo "All tests complete. Processing results..."
+
+# Process results from the temp file
+while IFS=: read -r STATUS IP HOSTNAME; do
+    if [ "$STATUS" == "SUCCESS" ]; then
+        SUCCESS_IPS+=("$IP (Hostname: $HOSTNAME)")
+    else
+        FAILED_IPS+=("$IP")
+    fi
+done < "$TEMP_FILE"
+
+# --- 6. Final Summary ---
+echo -e "\n--------------------------------------------------"
+echo "Scan Complete: Final Summary"
+echo "--------------------------------------------------"
+
+echo -e "✅ Accessible Raspberry Pis ($USERNAME@...):"
+if [ ${#SUCCESS_IPS[@]} -eq 0 ]; then
+    echo "   (None)"
+else
+    # Sort the results for a clean list
+    IFS=$'\n' sorted_success=($(sort <<<"${SUCCESS_IPS[*]}"))
+    unset IFS
+    
+    for ip_info in "${sorted_success[@]}"; do
+        echo "   - $ip_info"
+    done
+fi
+
+echo -e "\n❌ Unreachable or Failed IPs (from potential list):"
+if [ ${#FAILED_IPS[@]} -eq 0 ]; then
+    echo "   (None)"
+else
+    # Sort the results
+    IFS=$'\n' sorted_failed=($(sort <<<"${FAILED_IPS[*]}"))
+    unset IFS
+    
+    for ip in "${sorted_failed[@]}"; do
+        echo "   - $ip"
+    done
+fi
+echo "--------------------------------------------------"
