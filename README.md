@@ -1,5 +1,3 @@
-# scripts
-Some of the scripts that i use for different situations
+Some of the scripts that I use for different situations.
 
-
-1. detect-raspberry - will scan the whole network to find all the raspberry PIs, using MAC scan and trying ssh (if it's enabled on them and if the key is added to authorized_keys)
+1. **detect-raspberry** - Scans the whole network to find all Raspberry Pis by using a MAC scan and attempting to SSH (if SSH is enabled on them and if your key is in their authorized_keys file).
